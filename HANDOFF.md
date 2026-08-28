@@ -128,6 +128,7 @@ Firefox|2026-08-22 00:38:52|gui|/snap/bin/firefox
 |---|---|---|
 | `gui-events.log` | GNOME 焦点窗口产生的 GUI 使用事件 | GUI 使用的主要来源 |
 | `usage.log` | 采集脚本汇总的 CLI 命令、Fcitx/IBus 记录（每种软件只保留一行，按名字更新最后使用时间） | CLI 和输入法使用证据 |
+| `ime-engines.log` | fcitx5 引擎切换事件（只在切换时记录） | 判定哪些输入法引擎包从未被使用 |
 | `pids.log` | 旧版进程快照（遗留） | 不再更新；只能说明采集时运行过，不能证明长期使用 |
 | `app_pids.log` | 旧版脚本识别到的 GUI PID（遗留） | 不再更新；报告已不读取 |
 | `tracker-debug.log` | 扩展调试信息 | 排查焦点、PID、App 映射问题；持续增长，无轮转 |
@@ -187,7 +188,7 @@ systemctl --user stop    software-tracker.service
 
 - Shell history 新增命令（增量读取，重启续读）；
 - 命令对应的 APT 软件包（内建命令/别名不映射）；
-- Fcitx 5 或 IBus 是否在用（证据来源记为二进制名，便于映射到包）。
+- Fcitx 5 是否在用（框架证据记 usage.log），以及引擎切换事件（记 `ime-engines.log`，只在切换时记录，供报告判定引擎包是否用过）。
 
 GUI 使用证据完全由 GNOME 扩展负责，脚本不再扫描 GUI 进程。
 
@@ -211,7 +212,21 @@ GUI 使用证据完全由 GNOME 扩展负责，脚本不再扫描 GUI 进程。
 - APT 长期未发现使用证据的软件候选；
 - Snap 使用情况；
 - Flatpak 使用情况；
+- 输入法引擎使用情况（见下）；
 - 未映射的 GUI 使用证据。
+
+### 输入法引擎插件的检测方式
+
+检测粒度是**包**（能被卸载的单位）：包内任一引擎被切换使用过，整包视为已使用；包内所有引擎从未出现过，则是清理候选。这样"拼音用过、五笔没用过"不会把 `fcitx5-pinyin` 误判为候选——引擎和包的映射链是：
+
+```text
+引擎 id（如 pinyin / shuangpin / wbx / keyboard-us）
+    → /usr/share/fcitx5/inputmethod/<id>.conf 的 Addon= 字段
+    → （keyboard-* 前缀按 fcitx5 约定归 keyboard 插件）
+    → /usr/share/fcitx5/addon/<addon>.conf 的 dpkg 归属包
+```
+
+只有 `Category=InputMethod` 的 addon 参与判定，剪贴板、云拼音等工具插件不会误报。引擎证据积累不足 7 天时候选只显示"待判定"，避免刚部署就误报。
 
 对 executable 先去重再查包、时间按字符串比较、desktop 文件一次性批量查询后，全量报告约 5 秒完成（旧版逐行 fork `dpkg-query` 需数分钟）。
 
@@ -268,6 +283,7 @@ SOURCE 直查包 → desktop 可执行名 → desktop 应用名 → 未映射（
 4. 报告已输出最近使用时间、证据类型、来源；如需更强决策依据，可再增加置信度字段。
 5. 连续运行一段时间后再使用 30、90、180 天阈值比较结果，不要基于刚开始采集的短期数据卸载软件。
 6. 报告已不读取 `pids.log`、`app_pids.log`、`tracker-test.log` 等遗留文件；确认无用后可从数据目录删除。`tracker-debug.log` 持续增长且无轮转，可考虑在扩展中降低调试输出。
+7. ~~输入法引擎插件检测~~ 已完成：引擎切换证据 + 包级聚合判定（见"输入法引擎插件的检测方式"）。可选增强：`fcitx5-remote -n` 取不到的引擎（无 inputmethod conf 也无 keyboard 前缀）目前显示"归属包未知"，可积累规则。
 
 ## 安全原则
 
