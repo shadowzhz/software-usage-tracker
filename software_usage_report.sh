@@ -40,6 +40,11 @@ declare -A IME_PKG_LAST=()          # apt:包名 -> 最近一次引擎使用时�
 declare -A IME_INSTALLED_PKGS=()    # apt:包名 -> 1（安装了引擎类插件的包）
 IME_MATURE=0                        # 引擎证据是否已积累满 7 天
 
+# 组件/插件包 atime 证据（由 load_component_evidence 填充）
+declare -A COMP_UNUSED=()           # 包名 -> 版本（窗口内未发现访问证据）
+COMP_USED_COUNT=0
+COMPONENT_ATIME_OK=1                # 挂载为 noatime 时证据不可用，置 0
+
 # 把 executable 解析成 snap/apt 包，输出为空表示无法可靠映射。
 # env/bash 等包装器不解析，避免把应用算进 coreutils 之类的包。
 resolve_source() {
@@ -486,6 +491,182 @@ load_ime_evidence() {
     fi
 }
 
+# 依赖图清理候选：autoremove 模拟 + Snap 旧版本 + Flatpak 未使用运行时。
+# 与使用证据无关，是确定性结论；全部只读，删除命令需人工执行。
+print_cleanup_report() {
+    local COUNT=0
+
+    printf '\n[清理候选（依赖图判定，确定性）]\n'
+
+    if command -v apt-get >/dev/null 2>&1; then
+        COUNT=$(apt-get -s autoremove 2>/dev/null | grep -c '^Remv ' || true)
+        if [ "$COUNT" -gt 0 ]; then
+            printf 'APT 孤儿依赖（autoremove 会移除，共 %s 个）:\n' "$COUNT"
+            apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print "可移除\t" $2}' | head -60
+            [ "$COUNT" -gt 60 ] && printf '……其余 %s 个略\n' "$((COUNT - 60))"
+            printf '执行需人工确认: apt autoremove\n'
+        else
+            printf 'APT 孤儿依赖: 无\n'
+        fi
+    fi
+
+    if command -v snap >/dev/null 2>&1; then
+        COUNT=$(snap list --all 2>/dev/null | grep -c 'disabled' || true)
+        if [ "$COUNT" -gt 0 ]; then
+            printf 'Snap 旧版本残留（disabled，共 %s 个）:\n' "$COUNT"
+            snap list --all 2>/dev/null | grep 'disabled' | awk '{print "可移除\t" $1 "\t" $2 "\trev" $3}'
+            printf '执行需人工确认: snap remove <名称> --revision=<修订号>\n'
+        else
+            printf 'Snap 旧版本残留: 无\n'
+        fi
+    fi
+
+    if command -v flatpak >/dev/null 2>&1; then
+        COUNT=$(flatpak list --unused 2>/dev/null | wc -l)
+        if [ "$COUNT" -gt 0 ]; then
+            printf 'Flatpak 未使用运行时（共 %s 个）:\n' "$COUNT"
+            flatpak list --unused 2>/dev/null | awk '{print "可移除\t" $1}'
+            printf '执行需人工确认: flatpak uninstall --unused\n'
+        else
+            printf 'Flatpak 未使用运行时: 无\n'
+        fi
+    fi
+}
+
+# 组件/插件包通用检测：不针对特定应用，靠文件 atime。
+# 组件被宿主加载/读取时其文件 atime 会更新（relatime 下每天至少一次）；
+# 包内所有文件自窗口起点起都未被读过的包，即"未发现使用证据"。
+# 覆盖库、解码器插件、词典、字体、主题、无桌面入口的 CLI 工具等所有形态。
+load_component_evidence() {
+    local OPTS STATUS_FILE ACC PRE
+
+    OPTS=$(findmnt -no OPTIONS / 2>/dev/null)
+    case ",$OPTS," in
+        *,noatime,*)
+            COMPONENT_ATIME_OK=0
+            return
+            ;;
+    esac
+
+    STATUS_FILE="/var/lib/dpkg/status"
+    ACC="$TMP_DIR/accessed"
+    PRE="$TMP_DIR/compmeta"
+
+    find /usr /lib /lib64 /opt /etc /var/lib -xdev -type f \
+        -newerat "$CUTOFF_TEXT" -print 2>/dev/null > "$ACC"
+
+    # 前置映射: A=窗口内被访问过的文件, D=拥有桌面入口的包
+    {
+        sed 's|^|A\t|' "$ACC"
+        if [ "${#DESKTOP_APT[@]}" -gt 0 ]; then
+            printf '%s\n' "${!DESKTOP_APT[@]}" | sed 's|^|D\t|'
+        fi
+    } > "$PRE"
+
+    awk -F'\t' -v pre="$PRE" -v st="$STATUS_FILE" '
+        function flushpkg(   m, prio, ess, prot, ver) {
+            if (curpkg == "" || ! (curpkg in meta)) return
+            split(meta[curpkg], m, "\t")
+            prio = m[1]; ess = m[2]; prot = m[3]; ver = m[4]
+
+            if (prio == "required" || ess == "yes" || prot == "yes") return
+            if (curpkg in desk) return
+            if (curpkg ~ /^(linux-(image|headers|modules|firmware|tools|source)|linux-base|firmware-|nvidia-dkms|initramfs-tools|shim|secureboot|mokutil)|-dkms$/) return
+            if (nscan == 0) return        # 文件都在扫描目录之外，证据不可判
+
+            if (used) {
+                usedcnt++
+            } else {
+                printf "N\t%s\t%s\n", curpkg, ver
+            }
+        }
+
+        FILENAME == pre {
+            if ($1 == "A") acc[$2] = 1
+            else if ($1 == "D") desk[$2] = 1
+            next
+        }
+
+        FILENAME == st {
+            if ($0 ~ /^Package: /)       pkg = substr($0, 10)
+            else if ($0 ~ /^Status: /)   stat = substr($0, 9)
+            else if ($0 ~ /^Version: /)  ver = substr($0, 10)
+            else if ($0 ~ /^Priority: /) prio = substr($0, 11)
+            else if ($0 ~ /^Essential: /) ess = substr($0, 12)
+            else if ($0 ~ /^Protected: /) prot = substr($0, 12)
+            else if ($0 == "") {
+                if (pkg != "" && stat ~ /installed$/) {
+                    meta[pkg] = prio "\t" ess "\t" prot "\t" ver
+                }
+                pkg = ""; stat = ""; ver = ""; prio = ""; ess = ""; prot = ""
+            }
+            next
+        }
+
+        # /var/lib/dpkg/info/<包>[.<架构>].list
+        FILENAME != curfile {
+            flushpkg()
+            curfile = FILENAME
+            curpkg = curfile
+            sub(/.*\//, "", curpkg)
+            sub(/\.list$/, "", curpkg)
+            sub(/:(amd64|i386|arm64|armhf|armel|riscv64|ppc64el|s390x|all)$/, "", curpkg)
+            used = 0
+            nscan = 0
+        }
+
+        {
+            if (!used && ($0 in acc)) used = 1
+            if ($0 ~ /^\/(usr|lib|lib64|opt|etc|var\/lib)\//) nscan = 1
+        }
+
+        END {
+            flushpkg()
+            printf "U\t%s\n", usedcnt
+        }
+    ' "$PRE" "$STATUS_FILE" /var/lib/dpkg/info/*.list > "$TMP_DIR/compout"
+
+    local LINE KIND PKG VER
+    while IFS=$'\t' read -r KIND PKG VER; do
+        if [ "$KIND" = "U" ]; then
+            COMP_USED_COUNT="$PKG"
+        elif [ "$KIND" = "N" ] && [ -n "$PKG" ]; then
+            COMP_UNUSED["$PKG"]="$VER"
+        fi
+    done < "$TMP_DIR/compout"
+}
+
+print_component_report() {
+    local PKG VER N=0
+
+    printf '\n[组件/插件包访问证据（atime，窗口 %s 天）]\n' "$DAYS"
+
+    if [ "$COMPONENT_ATIME_OK" -eq 0 ]; then
+        printf '（根分区以 noatime 挂载，atime 不更新，本节不可判定）\n'
+        return
+    fi
+
+    if [ "${#COMP_UNUSED[@]}" -eq 0 ]; then
+        printf '所有组件包在窗口内均有访问痕迹，未发现候选。\n'
+        return
+    fi
+
+    printf '机制: 包内所有文件自窗口起点均未被任何程序读取，即未发现使用证据。\n'
+    printf '已排除: 必需/受保护/内核固件类包、有桌面入口的应用（见 APT 候选节）。\n'
+    printf '组件包统计: 有访问证据 %s，未发现访问证据 %s\n' \
+        "$COMP_USED_COUNT" "${#COMP_UNUSED[@]}"
+
+    for PKG in "${!COMP_UNUSED[@]}"; do
+        N=$((N + 1))
+        [ "$N" -gt 60 ] && continue
+        VER="${COMP_UNUSED[$PKG]}"
+        printf '候选\t%s\t%s\n' "$PKG" "$VER"
+    done | sort -k2,2
+
+    [ "$N" -gt 60 ] && printf '……其余 %s 个略\n' "$((N - 60))"
+    printf 'atime 是间接证据（且不代表从未用过，仅窗口内无痕迹），删除前请人工确认。\n'
+}
+
 print_apt_report() {
     local KEY VALUE PACKAGE VERSION TIME TYPES SOURCES
     local USED_COUNT=0 UNUSED_COUNT=0
@@ -617,7 +798,10 @@ load_installed
 load_desktop_map
 accumulate_usage
 load_ime_evidence
+load_component_evidence
+print_cleanup_report
 print_apt_report
 print_other_report
 print_ime_report
+print_component_report
 print_unresolved
