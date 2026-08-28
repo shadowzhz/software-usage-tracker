@@ -10,7 +10,6 @@ DATA_DIR="$HOME/.local/share/unused-software"
 
 USAGE_LOG="$DATA_DIR/usage.log"
 HISTORY_SIZE_FILE="$DATA_DIR/history.size"
-APP_PID_FILE="$DATA_DIR/app_pids.log"
 
 mkdir -p "$DATA_DIR"
 
@@ -128,116 +127,17 @@ get_package_from_command() {
 
     [ -z "$PATHNAME" ] && return
 
+    # 内建命令/别名解析结果不含路径，交给 dpkg 会模糊误配
+    case "$PATHNAME" in
+        */*) ;;
+        *) return ;;
+    esac
+
     PACKAGE=$(dpkg -S "$PATHNAME" 2>/dev/null |
         head -n 1 |
         cut -d ':' -f 1)
 
     echo "$PACKAGE"
-
-}
-
-
-# ========================================
-# 获取当前用户的桌面应用
-# ========================================
-
-get_desktop_apps() {
-
-    local DESKTOP_FILE
-    local APP_NAME
-    local EXEC_LINE
-    local EXEC_NAME
-
-    for DESKTOP_FILE in \
-        "$HOME/.local/share/applications/"*.desktop \
-        "/usr/share/applications/"*.desktop
-    do
-
-        [ -f "$DESKTOP_FILE" ] || continue
-
-        grep -q "^NoDisplay=true" "$DESKTOP_FILE" && continue
-        grep -q "^Hidden=true" "$DESKTOP_FILE" && continue
-
-        APP_NAME=$(grep "^Name=" "$DESKTOP_FILE" |
-            head -n 1 |
-            cut -d '=' -f 2-)
-
-        EXEC_LINE=$(grep "^Exec=" "$DESKTOP_FILE" |
-            head -n 1 |
-            cut -d '=' -f 2-)
-
-        [ -z "$APP_NAME" ] && continue
-        [ -z "$EXEC_LINE" ] && continue
-
-        EXEC_NAME=$(echo "$EXEC_LINE" |
-            awk '{print $1}')
-
-        EXEC_NAME=$(basename "$EXEC_NAME")
-
-        echo "$APP_NAME|$EXEC_NAME|$DESKTOP_FILE"
-
-    done |
-    sort -u
-
-}
-
-
-# ========================================
-# 检测 GUI 应用
-#
-# 通过 .desktop 文件匹配真正的应用。
-# 不记录应用产生的子进程。
-# ========================================
-
-check_gui_apps() {
-
-    local PID
-    local COMMAND
-    local APP_NAME
-    local EXEC_NAME
-    local DESKTOP_FILE
-
-    ps -u "$USER" -o pid=,comm= 2>/dev/null |
-    while read -r PID COMMAND; do
-
-        [ -z "$PID" ] && continue
-        [ -z "$COMMAND" ] && continue
-
-        # 这个 PID 已经处理过
-        if grep -q "^${PID}|" "$APP_PID_FILE" 2>/dev/null; then
-            continue
-        fi
-
-        APP_NAME=""
-        EXEC_NAME=""
-        DESKTOP_FILE=""
-
-        while IFS='|' read -r NAME EXEC FILE; do
-
-            if [ "$COMMAND" = "$EXEC" ]; then
-
-                APP_NAME="$NAME"
-                EXEC_NAME="$EXEC"
-                DESKTOP_FILE="$FILE"
-
-                break
-
-            fi
-
-        done < <(get_desktop_apps)
-
-        # 没有对应 .desktop
-        [ -z "$APP_NAME" ] && continue
-
-        echo "$PID|$APP_NAME" >> "$APP_PID_FILE"
-
-        record_usage \
-            "$APP_NAME" \
-            "$(current_time)" \
-            "gui" \
-            "$EXEC_NAME"
-
-    done
 
 }
 
@@ -312,7 +212,14 @@ check_shell_history() {
             COMMAND=$(echo "$COMMAND" |
                 awk '{print $1}')
 
-            COMMAND=$(basename "$COMMAND")
+            # 多行命令的续行片段（如 --dest）不是命令
+            case "$COMMAND" in
+                ''|-*)
+                    continue
+                    ;;
+            esac
+
+            COMMAND=$(basename -- "$COMMAND")
 
             [ -z "$COMMAND" ] && continue
 
@@ -397,32 +304,6 @@ check_ibus() {
 
 
 # ========================================
-# 清理已经结束的 GUI PID
-# ========================================
-
-cleanup_app_pids() {
-
-    local PID
-    local APP
-
-    [ -f "$APP_PID_FILE" ] || return
-
-    while IFS='|' read -r PID APP; do
-
-        [ -z "$PID" ] && continue
-
-        if ! kill -0 "$PID" 2>/dev/null; then
-
-            sed -i "\|^${PID}|d" "$APP_PID_FILE"
-
-        fi
-
-    done < "$APP_PID_FILE"
-
-}
-
-
-# ========================================
 # 初始化
 # ========================================
 
@@ -434,22 +315,20 @@ echo "检查间隔: $INTERVAL 秒"
 echo "数据目录: $DATA_DIR"
 echo
 echo "监控:"
-echo "  - GUI 应用"
 echo "  - CLI 软件"
 echo "  - Fcitx / IBus"
 echo
-echo "不会记录系统后台进程"
+echo "GUI 使用由 GNOME 扩展 gnome-software-tracker 记录"
 echo "不会执行任何卸载操作"
 echo
 echo "正在运行..."
-echo "按 Ctrl+C 停止"
-echo
 
 
 # ========================================
-# 初始化 Shell History
+# 初始化 Shell History 断点
 #
-# 不把旧历史算成现在使用。
+# 断点文件已存在时从上次位置继续，
+# 保证服务重启期间写入的历史不丢失。
 # ========================================
 
 for HISTORY_FILE in \
@@ -457,7 +336,7 @@ for HISTORY_FILE in \
     "$HOME/.bash_history"
 do
 
-    if [ -f "$HISTORY_FILE" ]; then
+    if [ -f "$HISTORY_FILE" ] && [ ! -f "$HISTORY_SIZE_FILE.$(basename "$HISTORY_FILE")" ]; then
 
         SIZE=$(stat -c %s "$HISTORY_FILE" 2>/dev/null)
 
@@ -473,9 +352,9 @@ done
 # 主循环
 # ========================================
 
-while true; do
+trap 'exit 0' TERM INT
 
-    check_gui_apps
+while true; do
 
     check_shell_history
 
@@ -483,8 +362,8 @@ while true; do
 
     check_ibus
 
-    cleanup_app_pids
+    sleep "$INTERVAL" &
 
-    sleep "$INTERVAL"
+    wait $!
 
 done
