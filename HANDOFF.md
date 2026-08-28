@@ -221,21 +221,19 @@ GUI 使用证据完全由 GNOME 扩展负责，脚本不再扫描 GUI 进程。
 
 ### 1. GUI executable 不一定能直接映射到软件包
 
-例如桌面文件可能使用：
+报告现在会扫描 `/usr/share/applications`、`~/.local/share/applications`、Snap 与 Flatpak 的 desktop 文件，建立两张兜底映射：应用显示名 → 包（如 `Name[zh_CN]=微信` → `apt:wechat`）和可执行文件名 → 包（如钉钉启动脚本）。GUI 证据的解析顺序：
 
 ```text
-Exec=env ... /usr/bin/wechat
+SOURCE 直查包 → desktop 可执行名 → desktop 应用名 → 未映射（observed:应用名）
 ```
 
-GNOME AppInfo 返回的 executable 可能是 `env`，因此报告会将它列为“未映射的 GUI 使用证据”，而不是错误地归入 `coreutils`。
+微信（`Exec=env ... /usr/bin/wechat`，日志来源是 `env`）和钉钉（用户脚本 `/home/<user>/.local/bin/dingtalk.sh`）都已借此映射到包；映射对历史日志同样生效。
 
-钉钉使用用户脚本启动：
+仍会进入"未映射"的残留情况：
 
-```text
-/home/<user>/.local/bin/dingtalk.sh
-```
-
-这类应用需要根据 `.desktop` 文件或启动脚本增加显式映射规则。
+- 应用已卸载，desktop 文件不存在（如 QTerminal）；
+- desktop 文件无包归属（用户自建、AppImage 等），映射不到任何包；
+- 名字对应多个包的歧义场景宁可不映射，不猜。
 
 ### 2. `pids.log`/`app_pids.log` 是遗留数据
 
@@ -264,7 +262,7 @@ GNOME AppInfo 返回的 executable 可能是 `env`，因此报告会将它列为
 
 按优先级建议：
 
-1. 为 `software_usage_report.sh` 增加 `.desktop` 的 `Name`/`Exec` 到包名的映射，解决微信、钉钉等启动器问题（目前只把含 desktop 文件的包纳入候选筛选，未做 Exec 映射）。
+1. ~~为 `software_usage_report.sh` 增加 `.desktop` 的 `Name`/`Exec` 到包名的映射~~ 已完成：扫描系统/用户/Snap/Flatpak 的 desktop 文件建立兜底映射，微信、钉钉已解决。可选增强：无包归属的 desktop 文件（AppImage 等）目前不参与映射。
 2. ~~从 `software_tracker.sh` 移除重复的 `check_gui_apps()`~~ 已完成：GUI 记录完全由 GNOME 扩展负责，采集脚本改为 systemd user 服务常驻。
 3. 让 `usage.log` 和 `gui-events.log` 使用统一的 source/id 字段，减少名称匹配和包装脚本带来的歧义。
 4. 报告已输出最近使用时间、证据类型、来源；如需更强决策依据，可再增加置信度字段。
