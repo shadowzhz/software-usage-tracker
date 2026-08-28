@@ -1,5 +1,5 @@
 {
-    "uuid": "gnome-software-tracker@shadowemperor",
+    "uuid": "gnome-software-tracker",
     "name": "Software Usage Tracker",
     "description": "Records applications used by the current user.",
     "version": 3,

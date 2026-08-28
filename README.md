@@ -24,7 +24,7 @@ Linux 桌面用户装软件容易、清理难：装的时候是明确的，忘�
 ## 组成
 
 ```text
-extension/gnome-software-tracker@shadowemperor/   GNOME Shell 扩展：记录焦点窗口的 GUI 使用事件
+extension/gnome-software-tracker/   GNOME Shell 扩展：记录焦点窗口的 GUI 使用事件
 scripts/software-tracker.sh                       采集器（systemd user 服务常驻）：Shell history 增量、
                                                   CLI→APT 包映射、fcitx5 框架与引擎切换证据
 scripts/software-usage-report.sh                  报告生成器（只读，约 10 秒出全量报告）
@@ -39,8 +39,8 @@ docs/HANDOFF.md                                   设计细节与已知限制（
 ```bash
 # 1. GNOME 扩展（GUI 使用证据）
 mkdir -p ~/.local/share/gnome-shell/extensions
-cp -r extension/gnome-software-tracker@shadowemperor ~/.local/share/gnome-shell/extensions/
-gnome-extensions enable gnome-software-tracker@shadowemperor
+cp -r extension/gnome-software-tracker ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable gnome-software-tracker
 # X11 会话可用 Alt+F2 输入 'r' 重启 Shell；Wayland 需注销重登
 
 # 2. 采集服务（CLI / 输入法证据）

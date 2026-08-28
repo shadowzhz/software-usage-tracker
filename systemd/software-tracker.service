@@ -1,6 +1,6 @@
 [Unit]
 Description=Software usage evidence collector (CLI history / input method)
-# GUI 使用由 GNOME 扩展 gnome-software-tracker@shadowemperor 记录，本服务只采集 CLI 和输入法证据。
+# GUI 使用由 GNOME 扩展 gnome-software-tracker 记录，本服务只采集 CLI 和输入法证据。
 PartOf=graphical-session.target
 After=graphical-session.target
 

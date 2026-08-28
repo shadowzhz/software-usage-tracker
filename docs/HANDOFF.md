@@ -35,7 +35,7 @@ Clearing/
 ├── docs/
 │   └── HANDOFF.md
 ├── extension/
-│   └── gnome-software-tracker@shadowemperor/
+│   └── gnome-software-tracker/
 │       ├── extension.js
 │       └── metadata.json
 ├── scripts/
@@ -49,7 +49,7 @@ Clearing/
 
 | 文件 | 职责 |
 |---|---|
-| `extension/gnome-software-tracker@shadowemperor/extension.js` | 监听 GNOME 当前焦点窗口，记录 GUI 使用事件 |
+| `extension/gnome-software-tracker/extension.js` | 监听 GNOME 当前焦点窗口，记录 GUI 使用事件 |
 | `scripts/software-tracker.sh` | 采集 CLI、Shell history、Fcitx/IBus 等使用证据；由 systemd user 服务常驻运行 |
 | `scripts/software-usage-report.sh` | 汇总已安装软件和使用证据，输出报告 |
 | `systemd/software-tracker.service` | 采集器的 systemd user 服务单元 |
@@ -65,19 +65,19 @@ Clearing/
 Ubuntu
 GNOME Shell 50.1
 /usr/bin/gnome-shell --mode=ubuntu
-扩展 UUID: gnome-software-tracker@shadowemperor
+扩展 UUID: gnome-software-tracker
 ```
 
 扩展安装目录：
 
 ```text
-~/.local/share/gnome-shell/extensions/gnome-software-tracker@shadowemperor/
+~/.local/share/gnome-shell/extensions/gnome-software-tracker/
 ```
 
 扩展状态检查：
 
 ```bash
-gnome-extensions info gnome-software-tracker@shadowemperor
+gnome-extensions info gnome-software-tracker
 ```
 
 当前已确认：扩展可以加载，状态为 `ACTIVE`，焦点信号能够触发。
@@ -156,14 +156,14 @@ Firefox|2026-08-22 00:38:52|gui|/snap/bin/firefox
 扩展通常由 GNOME Shell 自动运行。查看状态：
 
 ```bash
-gnome-extensions info gnome-software-tracker@shadowemperor
+gnome-extensions info gnome-software-tracker
 ```
 
 禁用和启用：
 
 ```bash
-gnome-extensions disable gnome-software-tracker@shadowemperor
-gnome-extensions enable gnome-software-tracker@shadowemperor
+gnome-extensions disable gnome-software-tracker
+gnome-extensions enable gnome-software-tracker
 ```
 
 如果磁盘上的代码和运行中的版本不一致，需要重新启动 GNOME Shell 或重新登录。当前已观察到：磁盘 `metadata.json` 是版本 `1`，但运行中的 Shell 曾报告版本 `3`，说明扩展模块仍被缓存。
