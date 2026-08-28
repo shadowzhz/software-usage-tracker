@@ -24,12 +24,12 @@ Linux 桌面用户装软件容易、清理难：装的时候是明确的，忘�
 ## 组成
 
 ```text
-gnome-software-tracker@shadowemperor/   GNOME Shell 扩展：记录焦点窗口的 GUI 使用事件
-software_tracker.sh                     采集器（systemd user 服务常驻）：Shell history 增量、
-                                        CLI→APT 包映射、fcitx5 框架与引擎切换证据
-software_usage_report.sh                报告生成器（只读，约 10 秒出全量报告）
-software-tracker.service                systemd user 服务单元
-HANDOFF.md                              设计细节与已知限制（中文）
+extension/gnome-software-tracker@shadowemperor/   GNOME Shell 扩展：记录焦点窗口的 GUI 使用事件
+scripts/software-tracker.sh                       采集器（systemd user 服务常驻）：Shell history 增量、
+                                                  CLI→APT 包映射、fcitx5 框架与引擎切换证据
+scripts/software-usage-report.sh                  报告生成器（只读，约 10 秒出全量报告）
+systemd/software-tracker.service                  systemd user 服务单元
+docs/HANDOFF.md                                   设计细节与已知限制（中文）
 ```
 
 数据目录：`~/.local/share/unused-software/`。所有数据只留在本机，不上传任何内容。
@@ -39,19 +39,20 @@ HANDOFF.md                              设计细节与已知限制（中文）
 ```bash
 # 1. GNOME 扩展（GUI 使用证据）
 mkdir -p ~/.local/share/gnome-shell/extensions
-cp -r gnome-software-tracker@shadowemperor ~/.local/share/gnome-shell/extensions/
+cp -r extension/gnome-software-tracker@shadowemperor ~/.local/share/gnome-shell/extensions/
 gnome-extensions enable gnome-software-tracker@shadowemperor
 # X11 会话可用 Alt+F2 输入 'r' 重启 Shell；Wayland 需注销重登
 
 # 2. 采集服务（CLI / 输入法证据）
 mkdir -p ~/.config/systemd/user
-cp software-tracker.service ~/.config/systemd/user/
+cp systemd/software-tracker.service ~/.config/systemd/user/
+# 若检出路径不同，先按需修改单元里的 ExecStart
 systemctl --user daemon-reload
 systemctl --user enable --now software-tracker.service
 
 # 3. 报告（默认按最近 180 天判定）
-./software_usage_report.sh          # 全量报告
-./software_usage_report.sh 30       # 指定天数窗口
+./scripts/software-usage-report.sh          # 全量报告
+./scripts/software-usage-report.sh 30       # 指定天数窗口
 ```
 
 扩展要求 GNOME Shell 50（`metadata.json` 中的 `shell-version`，可按需放宽）；采集服务只依赖 bash、coreutils、dpkg，可选 fcitx5 / snap / flatpak。

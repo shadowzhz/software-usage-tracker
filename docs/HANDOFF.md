@@ -30,24 +30,32 @@
 
 ```text
 Clearing/
-├── HANDOFF.md
-├── software_tracker.sh
-├── software_usage_report.sh
-└── gnome-software-tracker@shadowemperor/
-    ├── extension.js
-    └── metadata.json
+├── README.md
+├── LICENSE
+├── docs/
+│   └── HANDOFF.md
+├── extension/
+│   └── gnome-software-tracker@shadowemperor/
+│       ├── extension.js
+│       └── metadata.json
+├── scripts/
+│   ├── software-tracker.sh
+│   └── software-usage-report.sh
+└── systemd/
+    └── software-tracker.service
 ```
 
 文件职责：
 
 | 文件 | 职责 |
 |---|---|
-| `gnome-software-tracker@shadowemperor/extension.js` | 监听 GNOME 当前焦点窗口，记录 GUI 使用事件 |
-| `software_tracker.sh` | 采集 CLI、Shell history、Fcitx/IBus 等使用证据；由 systemd user 服务常驻运行 |
-| `software_usage_report.sh` | 汇总已安装软件和使用证据，输出报告 |
-| `HANDOFF.md` | 项目交接说明 |
+| `extension/gnome-software-tracker@shadowemperor/extension.js` | 监听 GNOME 当前焦点窗口，记录 GUI 使用事件 |
+| `scripts/software-tracker.sh` | 采集 CLI、Shell history、Fcitx/IBus 等使用证据；由 systemd user 服务常驻运行 |
+| `scripts/software-usage-report.sh` | 汇总已安装软件和使用证据，输出报告 |
+| `systemd/software-tracker.service` | 采集器的 systemd user 服务单元 |
+| `docs/HANDOFF.md` | 项目交接说明 |
 
-注：旧版基于文件 atime 的 `unused_software.sh` 已删除；GUI 记录完全由 GNOME 扩展负责，`software_tracker.sh` 不再扫描 GUI 进程。
+注：旧版基于文件 atime 的 `unused_software.sh` 已删除；GUI 记录完全由 GNOME 扩展负责，`scripts/software-tracker.sh` 不再扫描 GUI 进程。
 
 ## 系统环境
 
@@ -133,7 +141,7 @@ Firefox|2026-08-22 00:38:52|gui|/snap/bin/firefox
 | `app_pids.log` | 旧版脚本识别到的 GUI PID（遗留） | 不再更新；报告已不读取 |
 | `tracker-debug.log` | 扩展调试信息 | 排查焦点、PID、App 映射问题；持续增长，无轮转 |
 | `tracker-test.log` | 早期测试文件 | 当前主流程不使用 |
-| `history.size.*` | Shell history 增量读取位置 | 供 `software_tracker.sh` 使用；服务重启时从断点续读，停机期间的命令仍会被补采 |
+| `history.size.*` | Shell history 增量读取位置 | 供 `scripts/software-tracker.sh` 使用；服务重启时从断点续读，停机期间的命令仍会被补采 |
 
 `usage.log` 的旧格式为：
 
@@ -182,7 +190,7 @@ systemctl --user restart software-tracker.service
 systemctl --user stop    software-tracker.service
 ```
 
-服务单元位于 `~/.config/systemd/user/software-tracker.service`，指向项目目录中的 `software_tracker.sh`（磁盘未挂载时会自动重试直到就绪）。
+服务单元位于 `~/.config/systemd/user/software-tracker.service`，指向项目目录中的 `scripts/software-tracker.sh`（磁盘未挂载时会自动重试直到就绪）。
 
 脚本每 10 秒检查一次，只处理：
 
@@ -197,13 +205,13 @@ GUI 使用证据完全由 GNOME 扩展负责，脚本不再扫描 GUI 进程。
 默认按最近 180 天判断：
 
 ```bash
-~/Desktop/Project/Linux/Clearing/software_usage_report.sh
+~/Desktop/Project/Linux/Clearing/scripts/software-usage-report.sh
 ```
 
 指定天数，例如最近 30 天：
 
 ```bash
-~/Desktop/Project/Linux/Clearing/software_usage_report.sh 30
+~/Desktop/Project/Linux/Clearing/scripts/software-usage-report.sh 30
 ```
 
 报告包含：
@@ -289,8 +297,8 @@ SOURCE 直查包 → desktop 可执行名 → desktop 应用名 → 未映射（
 
 按优先级建议：
 
-1. ~~为 `software_usage_report.sh` 增加 `.desktop` 的 `Name`/`Exec` 到包名的映射~~ 已完成：扫描系统/用户/Snap/Flatpak 的 desktop 文件建立兜底映射，微信、钉钉已解决。可选增强：无包归属的 desktop 文件（AppImage 等）目前不参与映射。
-2. ~~从 `software_tracker.sh` 移除重复的 `check_gui_apps()`~~ 已完成：GUI 记录完全由 GNOME 扩展负责，采集脚本改为 systemd user 服务常驻。
+1. ~~为 `scripts/software-usage-report.sh` 增加 `.desktop` 的 `Name`/`Exec` 到包名的映射~~ 已完成：扫描系统/用户/Snap/Flatpak 的 desktop 文件建立兜底映射，微信、钉钉已解决。可选增强：无包归属的 desktop 文件（AppImage 等）目前不参与映射。
+2. ~~从 `scripts/software-tracker.sh` 移除重复的 `check_gui_apps()`~~ 已完成：GUI 记录完全由 GNOME 扩展负责，采集脚本改为 systemd user 服务常驻。
 3. 让 `usage.log` 和 `gui-events.log` 使用统一的 source/id 字段，减少名称匹配和包装脚本带来的歧义。
 4. 报告已输出最近使用时间、证据类型、来源；如需更强决策依据，可再增加置信度字段。
 5. 连续运行一段时间后再使用 30、90、180 天阈值比较结果，不要基于刚开始采集的短期数据卸载软件。
