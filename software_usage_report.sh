@@ -91,29 +91,160 @@ load_installed() {
     fi
 }
 
-load_desktop_packages() {
+# 扫描 .desktop 文件，建立 GUI 证据的兜底映射表：
+#   N 行: 应用显示名 -> 包       （解决微信、钉钉等 wrapper/脚本启动器）
+#   X 行: 可执行文件名 -> 包     （解决启动脚本路径与包内路径不一致）
+# 歧义名字（同名对应多个包）不映射，宁缺毋滥。无法归属包的 desktop 文件跳过。
+load_desktop_map() {
+    local DIR FILE BASE
+    local FILES_KEY="$TMP_DIR/desktop_files"
+
+    : > "$FILES_KEY"
+
+    for DIR in /usr/share/applications /usr/local/share/applications \
+        "$HOME/.local/share/applications"
+    do
+        while IFS= read -r -d '' FILE; do
+            printf '%s\t\n' "$FILE" >> "$FILES_KEY"
+        done < <(find "$DIR" -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null)
+    done
+
+    while IFS= read -r -d '' FILE; do
+        BASE=$(basename "$FILE" .desktop)
+        printf '%s\tsnap:%s\n' "$FILE" "${BASE%%_*}" >> "$FILES_KEY"
+    done < <(find /var/lib/snapd/desktop/applications -maxdepth 1 -type f \
+        -name '*.desktop' -print0 2>/dev/null)
+
+    for DIR in /var/lib/flatpak/exports/share/applications \
+        "$HOME/.local/share/flatpak/exports/share/applications"
+    do
+        while IFS= read -r -d '' FILE; do
+            printf '%s\tflatpak:%s\n' "$FILE" \
+                "$(basename "$FILE" .desktop)" >> "$FILES_KEY"
+        done < <(find "$DIR" -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null)
+    done
+
+    # 待定文件：用一次 dpkg-query 批量找归属包
+    awk -F'\t' '$2 == "" { print $1 }' "$FILES_KEY" > "$TMP_DIR/pending_desktops"
+
+    if [ -s "$TMP_DIR/pending_desktops" ]; then
+        local PENDING=() LINE PKG PATH_TEXT
+        mapfile -t PENDING < "$TMP_DIR/pending_desktops"
+
+        while IFS= read -r LINE; do
+            PKG="${LINE%%:*}"
+            case "$PKG" in
+                *' '*) continue ;;          # diversion 等非包行
+            esac
+            [ -z "$PKG" ] && continue
+            PATH_TEXT="${LINE#*: }"
+            [ -n "$PATH_TEXT" ] || continue
+            printf '%s\tapt:%s\n' "$PATH_TEXT" "$PKG" >> "$FILES_KEY"
+            DESKTOP_APT["apt:$PKG"]=1
+        done < <(dpkg-query -S "${PENDING[@]}" 2>/dev/null |
+            awk '!seen[$0]++')
+    fi
+
+    # 一次 grep 提取所有 desktop 的 Name*/Exec 行
     local DESKTOPS=()
-    local LINE PKG
-
-    while IFS= read -r -d '' DESKTOP; do
-        DESKTOPS+=("$DESKTOP")
-    done < <(
-        find "$HOME/.local/share/applications" /usr/share/applications \
-            -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null
-    )
-
+    mapfile -t DESKTOPS < <(awk -F'\t' '$2 != "" { print $1 }' "$FILES_KEY")
     [ "${#DESKTOPS[@]}" -eq 0 ] && return
 
-    # 一次查询所有 desktop 文件，输出形如 "libc6:amd64: /path/x.desktop"
-    while IFS= read -r LINE; do
-        PKG="${LINE%%:*}"
-        [ -n "$PKG" ] && DESKTOP_APT["apt:$PKG"]=1
-    done < <(dpkg-query -S "${DESKTOPS[@]}" 2>/dev/null || true)
+    grep -H -E '^(Name[^=]*|Exec)=' "${DESKTOPS[@]}" 2>/dev/null |
+    awk -F'\t' '
+        function basename_of(p) { sub(/.*\//, "", p); return p }
+
+        # 取 Exec 里真正的可执行文件：跳过 env 与变量赋值，处理引号
+        function exec_base(e,   n, tok, i, t) {
+            sub(/^[ \t]+/, "", e)
+            if (substr(e, 1, 1) == "\"") {
+                i = index(substr(e, 2), "\"")
+                t = (i > 0) ? substr(e, 2, i - 1) : e
+            } else {
+                n = split(e, tok, "[ \t]")
+                t = ""
+                for (i = 1; i <= n; i++) {
+                    if (tok[i] == "" || tok[i] == "env") continue
+                    if (tok[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue
+                    t = tok[i]
+                    break
+                }
+            }
+            if (t == "") return ""
+            return basename_of(t)
+        }
+
+        # FILES_KEY: FILE \t KEY
+        NR == FNR {
+            fkey[$1] = $2
+            order[++count] = $1
+            next
+        }
+
+        # grep 输出: FILE:KEY=VALUE
+        index($0, ":") > 0 {
+            file = substr($0, 1, index($0, ":") - 1)
+            rest = substr($0, index($0, ":") + 1)
+            dkey = substr(rest, 1, index(rest, "=") - 1)
+            dval = substr(rest, index(rest, "=") + 1)
+
+            if (file != cur) {
+                flush(cur)
+                cur = file
+                delete names
+                nexec = ""
+            }
+
+            if (dkey == "Exec") {
+                nexec = exec_base(dval)
+            } else if (dkey ~ /^Name/) {
+                if (dval != "") names[dval] = 1
+            }
+        }
+
+        function flush(f,   k, name) {
+            if (!(f in fkey) || fkey[f] == "") return
+            k = fkey[f]
+            for (name in names) {
+                printf "N\t%s\t%s\n", name, k
+            }
+            if (nexec != "") {
+                printf "X\t%s\t%s\n", nexec, k
+            }
+        }
+
+        END {
+            flush(cur)
+        }
+    ' "$FILES_KEY" - |
+    sort -u |
+    # 同名对应多个包的视为歧义，丢弃
+    awk -F'\t' '
+        {
+            id = $1 SUBSEP $2
+            if (id in amb) {
+                next
+            }
+            if (id in first && first[id] != $3) {
+                amb[id] = 1
+                next
+            }
+            first[id] = $3
+        }
+        END {
+            for (id in first) {
+                if (id in amb) continue
+                split(id, a, SUBSEP)
+                print a[1] "\t" a[2] "\t" first[id]
+            }
+        }
+    ' > "$TMP_DIR/desktop_map"
 }
 
 # 汇总两份日志的使用证据。
-# 先对 SOURCE 去重并逐个解析成包（source_map），再用一次 awk 遍历完成
-# 时间过滤、按 KEY 聚合最近使用时间和证据类型，避免每行 fork 子进程。
+# 先对 SOURCE 去重并逐个解析成包，加上 .desktop 映射表，再用一次 awk
+# 遍历完成时间过滤、按 KEY 聚合最近使用时间和证据类型，避免逐行 fork 子进程。
+# 解析顺序：SOURCE 直查包 -> desktop 可执行名 -> desktop 应用名 -> observed:应用名。
 accumulate_usage() {
     local SOURCE KEY
 
@@ -127,16 +258,23 @@ accumulate_usage() {
     : > "$TMP_DIR/source_map"
     while IFS= read -r SOURCE; do
         KEY=$(resolve_source "$SOURCE")
-        printf '%s\t%s\n' "$SOURCE" "$KEY" >> "$TMP_DIR/source_map"
+        printf 'S\t%s\t%s\n' "$SOURCE" "$KEY" >> "$TMP_DIR/source_map"
     done < "$TMP_DIR/sources"
+
+    # 前置映射统一为: TYPE \t VALUE \t KEY
+    cat "$TMP_DIR/source_map" "$TMP_DIR/desktop_map" > "$TMP_DIR/premap"
 
     awk -F'|' -v cutoff="$CUTOFF_TEXT" '
 
-        # source_map: SOURCE \t KEY，KEY 为空表示不可映射
+        # premap: S=SOURCE直查, N=desktop应用名, X=desktop可执行名
         NR == FNR {
-            i = index($0, "\t")
-            if (i > 0) {
-                map[substr($0, 1, i - 1)] = substr($0, i + 1)
+            split($0, m, "\t")
+            if (m[1] == "S") {
+                smap[m[2]] = m[3]
+            } else if (m[1] == "N") {
+                nmap[m[2]] = m[3]
+            } else if (m[1] == "X") {
+                xmap[m[2]] = m[3]
             }
             next
         }
@@ -147,7 +285,17 @@ accumulate_usage() {
         $2 < cutoff { next }
 
         {
-            key = ($4 in map) ? map[$4] : ""
+            key = ($4 in smap) ? smap[$4] : ""
+
+            if (key == "" && $3 == "gui") {
+                n = split($4, seg, "/")
+                base = seg[n]
+                key = (base in xmap) ? xmap[base] : ""
+                if (key == "" && ($1 in nmap)) {
+                    key = nmap[$1]
+                }
+            }
+
             if (key == "") {
                 key = "observed:" $1
             }
@@ -190,7 +338,7 @@ accumulate_usage() {
                 printf "observed:%s\t%s\t%s\t%s\n", name, obs_last[name], "-", obs_src[name]
             }
         }
-    ' "$TMP_DIR/source_map" "$USAGE_LOG" "$GUI_LOG" > "$TMP_DIR/used"
+    ' "$TMP_DIR/premap" "$USAGE_LOG" "$GUI_LOG" > "$TMP_DIR/used"
 
     local KEY LAST TYPES SOURCES NAME
     while IFS=$'\t' read -r KEY LAST TYPES SOURCES; do
@@ -298,7 +446,7 @@ printf '长期未发现使用证据阈值: %s 天\n' "$DAYS"
 printf '数据目录: %s\n' "$DATA_DIR"
 
 load_installed
-load_desktop_packages
+load_desktop_map
 accumulate_usage
 print_apt_report
 print_other_report
