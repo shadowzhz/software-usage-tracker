@@ -267,11 +267,12 @@ check_fcitx() {
 
     [ -z "$CURRENT_INPUT_METHOD" ] && return
 
+    # SOURCE 记录二进制名而不是引擎名，报告才能映射到 fcitx5 包
     record_usage \
         "fcitx5" \
         "$(current_time)" \
         "input-method" \
-        "$CURRENT_INPUT_METHOD"
+        "fcitx5"
 
 }
 
@@ -298,7 +299,7 @@ check_ibus() {
         "ibus" \
         "$(current_time)" \
         "input-method" \
-        "$CURRENT_INPUT_METHOD"
+        "ibus"
 
 }
 

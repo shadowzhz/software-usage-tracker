@@ -14,9 +14,12 @@ fi
 DATA_DIR="$HOME/.local/share/unused-software"
 GUI_LOG="$DATA_DIR/gui-events.log"
 USAGE_LOG="$DATA_DIR/usage.log"
-PID_LOG="$DATA_DIR/pids.log"
-APP_PID_LOG="$DATA_DIR/app_pids.log"
 CUTOFF=$(( $(date +%s) - DAYS * 86400 ))
+# 日志时间固定为 YYYY-MM-DD HH:MM:SS，补零后可直接按字符串比较
+CUTOFF_TEXT=$(date -d "@$CUTOFF" '+%Y-%m-%d %H:%M:%S')
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 declare -A INSTALLED_APT=()
 declare -A INSTALLED_SNAP=()
@@ -27,38 +30,15 @@ declare -A USED_SOURCES=()
 declare -A OBSERVED_GUI=()
 declare -A DESKTOP_APT=()
 
-mark_used() {
-    local KEY="$1"
-    local TIME="$2"
-    local TYPE="$3"
-    local SOURCE="$4"
-
-    [ -z "$KEY" ] && return
-
-    if [ -z "${USED_LAST[$KEY]+x}" ] || [ "$TIME" -gt "${USED_LAST[$KEY]}" ]; then
-        USED_LAST["$KEY"]="$TIME"
-    fi
-
-    case ",${USED_TYPES[$KEY]-}," in
-        *",$TYPE,"*) ;;
-        *) USED_TYPES["$KEY"]="${USED_TYPES[$KEY]-}${USED_TYPES[$KEY]:+,}$TYPE" ;;
-    esac
-
-    case ",${USED_SOURCES[$KEY]-}," in
-        *",$SOURCE,"*) ;;
-        *) USED_SOURCES["$KEY"]="${USED_SOURCES[$KEY]-}${USED_SOURCES[$KEY]:+,}$SOURCE" ;;
-    esac
-}
-
+# 把 executable 解析成 snap/apt 包，输出为空表示无法可靠映射。
+# env/bash 等包装器不解析，避免把应用算进 coreutils 之类的包。
 resolve_source() {
-    local NAME="$1"
-    local SOURCE="$2"
+    local SOURCE="$1"
     local PATHNAME=""
     local PACKAGE=""
 
     case "$SOURCE" in
         env|bash|sh|zsh|fish|python|python3|java|electron)
-            printf 'observed:%s\n' "$NAME"
             return
             ;;
         /snap/bin/*)
@@ -73,25 +53,18 @@ resolve_source() {
         PATHNAME=$(command -v "$SOURCE" 2>/dev/null || true)
     fi
 
-    if [ -n "$PATHNAME" ]; then
-        case "$PATHNAME" in
-            /snap/bin/*)
-                printf 'snap:%s\n' "$(basename "$PATHNAME")"
-                return
-                ;;
-        esac
+    case "$PATHNAME" in
+        /snap/bin/*)
+            printf 'snap:%s\n' "$(basename "$PATHNAME")"
+            return
+            ;;
+    esac
 
+    if [ -n "$PATHNAME" ]; then
         PACKAGE=$(dpkg-query -S "$PATHNAME" 2>/dev/null |
             head -n 1 | cut -d: -f1)
-
-        if [ -n "$PACKAGE" ]; then
-            printf 'apt:%s\n' "$PACKAGE"
-            return
-        fi
+        [ -n "$PACKAGE" ] && printf 'apt:%s\n' "$PACKAGE"
     fi
-
-    # 保留无法映射到包的 GUI 证据，供人工确认。
-    printf 'observed:%s\n' "$NAME"
 }
 
 load_installed() {
@@ -119,49 +92,121 @@ load_installed() {
 }
 
 load_desktop_packages() {
-    local DESKTOP PACKAGE
+    local DESKTOPS=()
+    local LINE PKG
 
-    while IFS= read -r DESKTOP; do
-        [ -f "$DESKTOP" ] || continue
-        PACKAGE=$(dpkg-query -S "$DESKTOP" 2>/dev/null |
-            head -n 1 | cut -d: -f1)
-        [ -n "$PACKAGE" ] && DESKTOP_APT["apt:$PACKAGE"]=1
+    while IFS= read -r -d '' DESKTOP; do
+        DESKTOPS+=("$DESKTOP")
     done < <(
         find "$HOME/.local/share/applications" /usr/share/applications \
-            -maxdepth 1 -type f -name '*.desktop' 2>/dev/null
+            -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null
     )
+
+    [ "${#DESKTOPS[@]}" -eq 0 ] && return
+
+    # 一次查询所有 desktop 文件，输出形如 "libc6:amd64: /path/x.desktop"
+    while IFS= read -r LINE; do
+        PKG="${LINE%%:*}"
+        [ -n "$PKG" ] && DESKTOP_APT["apt:$PKG"]=1
+    done < <(dpkg-query -S "${DESKTOPS[@]}" 2>/dev/null || true)
 }
 
-load_usage_log() {
-    local NAME TIME_TEXT TYPE SOURCE TIME KEY
+# 汇总两份日志的使用证据。
+# 先对 SOURCE 去重并逐个解析成包（source_map），再用一次 awk 遍历完成
+# 时间过滤、按 KEY 聚合最近使用时间和证据类型，避免每行 fork 子进程。
+accumulate_usage() {
+    local SOURCE KEY
 
-    [ -f "$USAGE_LOG" ] || return
+    {
+        [ -f "$USAGE_LOG" ] || [ -f "$GUI_LOG" ] || return
+    }
 
-    while IFS='|' read -r NAME TIME_TEXT TYPE SOURCE; do
-        TIME=$(date -d "$TIME_TEXT" +%s 2>/dev/null || true)
-        [[ "$TIME" =~ ^[0-9]+$ ]] || continue
-        [ "$TIME" -ge "$CUTOFF" ] || continue
-        KEY=$(resolve_source "$NAME" "$SOURCE")
-        mark_used "$KEY" "$TIME" "$TYPE" "$SOURCE"
-    done < "$USAGE_LOG"
-}
+    awk -F'|' 'NF >= 4 && $4 != "" { print $4 }' \
+        "$USAGE_LOG" "$GUI_LOG" 2>/dev/null | sort -u > "$TMP_DIR/sources"
 
-load_gui_log() {
-    local NAME TIME_TEXT TYPE SOURCE TIME KEY
+    : > "$TMP_DIR/source_map"
+    while IFS= read -r SOURCE; do
+        KEY=$(resolve_source "$SOURCE")
+        printf '%s\t%s\n' "$SOURCE" "$KEY" >> "$TMP_DIR/source_map"
+    done < "$TMP_DIR/sources"
 
-    [ -f "$GUI_LOG" ] || return
+    awk -F'|' -v cutoff="$CUTOFF_TEXT" '
 
-    while IFS='|' read -r NAME TIME_TEXT TYPE SOURCE; do
-        TIME=$(date -d "$TIME_TEXT" +%s 2>/dev/null || true)
-        [[ "$TIME" =~ ^[0-9]+$ ]] || continue
-        [ "$TIME" -ge "$CUTOFF" ] || continue
-        KEY=$(resolve_source "$NAME" "$SOURCE")
-        mark_used "$KEY" "$TIME" "$TYPE" "$SOURCE"
+        # source_map: SOURCE \t KEY，KEY 为空表示不可映射
+        NR == FNR {
+            i = index($0, "\t")
+            if (i > 0) {
+                map[substr($0, 1, i - 1)] = substr($0, i + 1)
+            }
+            next
+        }
 
-        if [[ "$KEY" == observed:* ]]; then
-            OBSERVED_GUI["$NAME"]="$TIME_TEXT|$SOURCE"
-        fi
-    done < "$GUI_LOG"
+        # 数据行: NAME|TIME|TYPE|SOURCE
+        NF < 4 { next }
+        $2 !~ /^[0-9][0-9][0-9][0-9]-/ { next }
+        $2 < cutoff { next }
+
+        {
+            key = ($4 in map) ? map[$4] : ""
+            if (key == "") {
+                key = "observed:" $1
+            }
+
+            if (!(key in last) || $2 > last[key]) {
+                last[key] = $2
+            }
+
+            if (index(types[key], "|" $3 "|") == 0) {
+                types[key] = types[key] "|" $3 "|"
+            }
+
+            if (index(sources[key], "|" $4 "|") == 0) {
+                sources[key] = sources[key] "|" $4 "|"
+            }
+
+            # 输入法状态不算未映射的 GUI 证据
+            if (key ~ /^observed:/ && $3 != "input-method") {
+                if (!($1 in obs_last) || $2 > obs_last[$1]) {
+                    obs_last[$1] = $2
+                    obs_src[$1] = $4
+                }
+            }
+        }
+
+        END {
+            for (key in last) {
+                t = types[key]
+                gsub(/^\|/, "", t)
+                gsub(/\|$/, "", t)
+                gsub(/\|\|/, ",", t)
+                s = sources[key]
+                gsub(/^\|/, "", s)
+                gsub(/\|$/, "", s)
+                gsub(/\|\|/, ",", s)
+                if (t == "") t = "-"
+                printf "%s\t%s\t%s\t%s\n", key, last[key], t, s
+            }
+            for (name in obs_last) {
+                printf "observed:%s\t%s\t%s\t%s\n", name, obs_last[name], "-", obs_src[name]
+            }
+        }
+    ' "$TMP_DIR/source_map" "$USAGE_LOG" "$GUI_LOG" > "$TMP_DIR/used"
+
+    local KEY LAST TYPES SOURCES NAME
+    while IFS=$'\t' read -r KEY LAST TYPES SOURCES; do
+        [ -n "$KEY" ] || continue
+        case "$KEY" in
+            observed:*)
+                NAME="${KEY#observed:}"
+                OBSERVED_GUI["$NAME"]="$LAST|$SOURCES"
+                ;;
+            *)
+                USED_LAST["$KEY"]="$LAST"
+                USED_TYPES["$KEY"]="$TYPES"
+                USED_SOURCES["$KEY"]="$SOURCES"
+                ;;
+        esac
+    done < "$TMP_DIR/used"
 }
 
 print_apt_report() {
@@ -186,7 +231,7 @@ print_apt_report() {
             SOURCES="${USED_SOURCES[$KEY]}"
             printf '已使用\t%s\t%s\t%s\t%s\t%s\n' \
                 "$PACKAGE" "$VERSION" \
-                "$(date -d "@$TIME" '+%Y-%m-%d %H:%M:%S')" \
+                "$TIME" \
                 "$TYPES" "$SOURCES"
         fi
     done | sort -k3,3r
@@ -215,7 +260,7 @@ print_other_report() {
         if [ -n "${USED_LAST[$KEY]+x}" ]; then
             TIME="${USED_LAST[$KEY]}"
             printf '已使用\t%s\t%s\t%s\t%s\n' "$PACKAGE" "$VERSION" \
-                "$(date -d "@$TIME" '+%Y-%m-%d %H:%M:%S')" "${USED_TYPES[$KEY]}"
+                "$TIME" "${USED_TYPES[$KEY]}"
         else
             printf '候选\t%s\t%s\n' "$PACKAGE" "$VERSION"
         fi
@@ -247,16 +292,6 @@ print_unresolved() {
     done | sort -k2,2
 }
 
-print_runtime_evidence() {
-    printf '\n[运行时快照: 仅表示采集时正在运行，不等同于长期使用证据]\n'
-    if [ -f "$APP_PID_LOG" ]; then
-        awk -F'|' 'NF >= 2 {print "GUI运行中\t" $2 "\tPID " $1}' "$APP_PID_LOG" | sort -u
-    fi
-    if [ -f "$PID_LOG" ]; then
-        printf 'pids.log 记录的是进程快照，未用于判定长期使用。\n'
-    fi
-}
-
 printf '软件使用汇总\n'
 printf '生成时间: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 printf '长期未发现使用证据阈值: %s 天\n' "$DAYS"
@@ -264,9 +299,7 @@ printf '数据目录: %s\n' "$DATA_DIR"
 
 load_installed
 load_desktop_packages
-load_usage_log
-load_gui_log
+accumulate_usage
 print_apt_report
 print_other_report
 print_unresolved
-print_runtime_evidence
