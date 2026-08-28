@@ -10,6 +10,9 @@ DATA_DIR="$HOME/.local/share/unused-software"
 
 USAGE_LOG="$DATA_DIR/usage.log"
 HISTORY_SIZE_FILE="$DATA_DIR/history.size"
+ENGINE_LOG="$DATA_DIR/ime-engines.log"
+
+LAST_IME_ENGINE=""
 
 mkdir -p "$DATA_DIR"
 
@@ -251,6 +254,8 @@ check_shell_history() {
 # Fcitx 5
 #
 # 不把 fcitx addon 当成软件使用。
+# 框架使用记 usage.log；引擎切换记 ime-engines.log，
+# 供报告判定哪些输入法引擎包从未被使用。
 # ========================================
 
 check_fcitx() {
@@ -273,6 +278,16 @@ check_fcitx() {
         "$(current_time)" \
         "input-method" \
         "fcitx5"
+
+    # 引擎切换事件：只在变化时记录
+    if [ "$CURRENT_INPUT_METHOD" != "$LAST_IME_ENGINE" ]; then
+
+        echo "$CURRENT_INPUT_METHOD|$(current_time)" \
+            >> "$ENGINE_LOG"
+
+        LAST_IME_ENGINE="$CURRENT_INPUT_METHOD"
+
+    fi
 
 }
 

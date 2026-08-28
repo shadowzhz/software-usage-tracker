@@ -14,6 +14,9 @@ fi
 DATA_DIR="$HOME/.local/share/unused-software"
 GUI_LOG="$DATA_DIR/gui-events.log"
 USAGE_LOG="$DATA_DIR/usage.log"
+IME_LOG="$DATA_DIR/ime-engines.log"
+FCITX_ADDON_DIR="/usr/share/fcitx5/addon"
+FCITX_IM_DIR="/usr/share/fcitx5/inputmethod"
 CUTOFF=$(( $(date +%s) - DAYS * 86400 ))
 # 日志时间固定为 YYYY-MM-DD HH:MM:SS，补零后可直接按字符串比较
 CUTOFF_TEXT=$(date -d "@$CUTOFF" '+%Y-%m-%d %H:%M:%S')
@@ -29,6 +32,13 @@ declare -A USED_TYPES=()
 declare -A USED_SOURCES=()
 declare -A OBSERVED_GUI=()
 declare -A DESKTOP_APT=()
+
+# 输入法引擎证据（由 load_ime_evidence 填充）
+declare -A IME_USED_ENGINES=()      # 引擎id -> 1
+declare -A IME_ENGINE_PKG=()        # 引擎id -> 归属包名（映射不到为空）
+declare -A IME_PKG_LAST=()          # apt:包名 -> 最近一次引擎使用时间
+declare -A IME_INSTALLED_PKGS=()    # apt:包名 -> 1（安装了引擎类插件的包）
+IME_MATURE=0                        # 引擎证据是否已积累满 7 天
 
 # 把 executable 解析成 snap/apt 包，输出为空表示无法可靠映射。
 # env/bash 等包装器不解析，避免把应用算进 coreutils 之类的包。
@@ -357,6 +367,125 @@ accumulate_usage() {
     done < "$TMP_DIR/used"
 }
 
+# 引擎 id -> fcitx5 addon id
+# 链路：inputmethod/<引擎>.conf 的 Addon= 字段（pinyin/shuangpin/wbx 等都走这里）
+#       keyboard-* 前缀按 fcitx5 约定归 keyboard 插件
+#       兜底：引擎 id 本身就是 addon id
+resolve_ime_addon() {
+    local ENGINE="$1"
+    local CONF ADDON=""
+
+    CONF="$FCITX_IM_DIR/$ENGINE.conf"
+    if [ -f "$CONF" ]; then
+        ADDON=$(grep -m1 '^Addon=' "$CONF" 2>/dev/null | cut -d= -f2)
+        [ -n "$ADDON" ] && printf '%s' "$ADDON" && return
+    fi
+
+    case "$ENGINE" in
+        keyboard-*)
+            printf 'keyboard'
+            return
+            ;;
+        table:*)
+            CONF="$FCITX_IM_DIR/${ENGINE#table:}.conf"
+            if [ -f "$CONF" ]; then
+                ADDON=$(grep -m1 '^Addon=' "$CONF" 2>/dev/null | cut -d= -f2)
+                [ -n "$ADDON" ] && printf '%s' "$ADDON" && return
+            fi
+            printf 'table'
+            return
+            ;;
+    esac
+
+    [ -f "$FCITX_ADDON_DIR/$ENGINE.conf" ] && printf '%s' "$ENGINE"
+}
+
+# 装载输入法引擎证据：
+#   引擎 -> addon -> 包，判定粒度是包（能卸载的单位）：
+#   包内任一引擎被切换使用过，整包算已使用；其余引擎包是清理候选。
+#   只统计 Category=InputMethod 的插件，工具类插件（剪贴板等）不参与。
+#   证据不足 7 天时只展示不判定，防止冷启动期误报。
+load_ime_evidence() {
+    local LINE E T ADDON PKG CONF
+    local FIRST_TIME=""
+
+    [ -d "$FCITX_ADDON_DIR" ] || return
+    [ -f "$IME_LOG" ] || return
+
+    while IFS='|' read -r E T; do
+        [ -z "$E" ] || [ -z "$T" ] && continue
+        IME_USED_ENGINES["$E"]=1
+        [ -z "$FIRST_TIME" ] && FIRST_TIME="$T"
+    done < "$IME_LOG"
+
+    [ "${#IME_USED_ENGINES[@]}" -gt 0 ] || return
+
+    local SEVEN_DAYS_AGO
+    SEVEN_DAYS_AGO=$(date -d '7 days ago' '+%Y-%m-%d %H:%M:%S')
+    if [ -n "$FIRST_TIME" ] && [[ "$FIRST_TIME" < "$SEVEN_DAYS_AGO" ]]; then
+        IME_MATURE=1
+    fi
+
+    # 引擎归属包 + 包级最近使用时间
+    for E in "${!IME_USED_ENGINES[@]}"; do
+        ADDON=$(resolve_ime_addon "$E")
+        [ -z "$ADDON" ] && continue
+
+        CONF="$FCITX_ADDON_DIR/$ADDON.conf"
+        PKG=$(dpkg-query -S "$CONF" 2>/dev/null | head -n 1 | cut -d: -f1)
+        [ -z "$PKG" ] && continue
+
+        IME_ENGINE_PKG["$E"]="$PKG"
+        IME_INSTALLED_PKGS["apt:$PKG"]=1
+    done
+
+    # 重算每个包的最近使用时间：逐引擎比对时间取最大
+    for E in "${!IME_ENGINE_PKG[@]}"; do
+        ADDON=$(resolve_ime_addon "$E")
+        PKG="${IME_ENGINE_PKG[$E]}"
+        [ -z "$PKG" ] && continue
+        while IFS='|' read -r E2 T2; do
+            [ "$E2" = "$E" ] || continue
+            if [ -z "${IME_PKG_LAST[apt:$PKG]+x}" ] || [[ "$T2" > "${IME_PKG_LAST[apt:$PKG]}" ]]; then
+                IME_PKG_LAST["apt:$PKG"]="$T2"
+            fi
+        done < "$IME_LOG"
+    done
+
+    # 把引擎包的使用证据并入主证据集，让 APT 汇总保持一致
+    local KEY
+    for KEY in "${!IME_PKG_LAST[@]}"; do
+        T="${IME_PKG_LAST[$KEY]}"
+        if [ -z "${USED_LAST[$KEY]+x}" ] || [[ "$T" > "${USED_LAST[$KEY]}" ]]; then
+            USED_LAST["$KEY"]="$T"
+        fi
+        case ",${USED_TYPES[$KEY]-}," in
+            *,input-method,*) ;;
+            *) USED_TYPES["$KEY"]="${USED_TYPES[$KEY]-}${USED_TYPES[$KEY]:+,}input-method" ;;
+        esac
+        case ",${USED_SOURCES[$KEY]-}," in
+            *,fcitx5-engine,*) ;;
+            *) USED_SOURCES["$KEY"]="${USED_SOURCES[$KEY]-}${USED_SOURCES[$KEY]:+,}fcitx5-engine" ;;
+        esac
+    done
+
+    # 已安装的引擎类插件包（一次批量查归属）
+    local ENGINE_CONFS=()
+    mapfile -t ENGINE_CONFS < <(grep -l '^Category=InputMethod' \
+        "$FCITX_ADDON_DIR"/*.conf 2>/dev/null)
+
+    if [ "${#ENGINE_CONFS[@]}" -gt 0 ]; then
+        while IFS= read -r LINE; do
+            PKG="${LINE%%:*}"
+            case "$PKG" in
+                *' '*) continue ;;
+            esac
+            [ -n "$PKG" ] && IME_INSTALLED_PKGS["apt:$PKG"]=1
+        done < <(dpkg-query -S "${ENGINE_CONFS[@]}" 2>/dev/null |
+            awk '!seen[$0]++')
+    fi
+}
+
 print_apt_report() {
     local KEY VALUE PACKAGE VERSION TIME TYPES SOURCES
     local USED_COUNT=0 UNUSED_COUNT=0
@@ -440,6 +569,45 @@ print_unresolved() {
     done | sort -k2,2
 }
 
+print_ime_report() {
+    local E KEY PKG
+
+    [ -d "$FCITX_ADDON_DIR" ] || return
+
+    printf '\n[输入法引擎使用情况]\n'
+
+    if [ "${#IME_USED_ENGINES[@]}" -eq 0 ]; then
+        printf '（暂无引擎使用记录）\n'
+        return
+    fi
+
+    for E in "${!IME_USED_ENGINES[@]}"; do
+        PKG="${IME_ENGINE_PKG[$E]-}"
+        if [ -n "$PKG" ]; then
+            printf '已用引擎\t%s（%s）\n' "$E" "$PKG"
+        else
+            printf '已用引擎\t%s（归属包未知）\n' "$E"
+        fi
+    done | sort -k2,2
+
+    if [ "${#IME_INSTALLED_PKGS[@]}" -eq 0 ]; then
+        return
+    fi
+
+    for KEY in "${!IME_INSTALLED_PKGS[@]}"; do
+        PKG="${KEY#apt:}"
+        if [ -n "${IME_PKG_LAST[$KEY]+x}" ]; then
+            printf '已使用\t%s\t最后切换 %s\n' "$PKG" "${IME_PKG_LAST[$KEY]}"
+        elif [ "$IME_MATURE" -eq 1 ]; then
+            printf '候选\t%s\t提供的引擎从未被切换使用\n' "$PKG"
+        else
+            printf '待判定\t%s\t引擎证据积累不足 7 天\n' "$PKG"
+        fi
+    done | sort -k2,2
+
+    printf '判定粒度是包：包内任一引擎被使用过即整包视为已使用。\n'
+}
+
 printf '软件使用汇总\n'
 printf '生成时间: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 printf '长期未发现使用证据阈值: %s 天\n' "$DAYS"
@@ -448,6 +616,8 @@ printf '数据目录: %s\n' "$DATA_DIR"
 load_installed
 load_desktop_map
 accumulate_usage
+load_ime_evidence
 print_apt_report
 print_other_report
+print_ime_report
 print_unresolved
