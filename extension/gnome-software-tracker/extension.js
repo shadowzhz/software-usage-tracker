@@ -5,30 +5,46 @@ import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+// notify::focus-window 在关窗/最小化/切换动画的首帧触发，任何同步磁盘 I/O
+// 都会挤占那一天的帧预算。因此事件只写入内存缓冲，由 GLib 空闲回调一次性
+// 落盘（打开→写→关闭各一次，目录仅在 enable 时创建）。
+// 调试日志默认关闭，设环境变量 GNOME_SOFTWARE_TRACKER_DEBUG=1 开启，
+// 开启后也走同一缓冲，不会产生逐行写盘。
 export default class SoftwareUsageTracker extends Extension {
 
     enable() {
 
         this._lastFocusedPid = null;
-        this._writeDebug('enable entered');
+        this._usageBuffer = [];
+        this._debugBuffer = [];
+        this._flushSource = 0;
+
+        this._dataDir = Gio.File.new_for_path(GLib.build_filenamev([
+            GLib.get_home_dir(),
+            '.local',
+            'share',
+            'unused-software',
+        ]));
+        this._usageFile = this._dataDir.get_child('gui-events.log');
+        this._debugFile = this._dataDir.get_child('tracker-debug.log');
+        this._debugEnabled = GLib.getenv('GNOME_SOFTWARE_TRACKER_DEBUG') === '1';
 
         try {
 
-            this._focusSignal = global.display.connect(
-                'notify::focus-window',
-                () => this._recordFocusWindow('signal')
-            );
+            this._dataDir.make_directory_with_parents(null);
 
-            this._writeDebug(`focus signal connected id=${this._focusSignal}`);
+        } catch {
 
-        } catch (error) {
-
-            this._writeDebug(`focus signal error=${error}`);
+            // 目录已存在。
 
         }
 
-        this._recordFocusWindow('initial');
+        this._focusSignal = global.display.connect(
+            'notify::focus-window',
+            () => this._recordFocusWindow()
+        );
 
+        this._recordFocusWindow();
 
     }
 
@@ -42,21 +58,25 @@ export default class SoftwareUsageTracker extends Extension {
 
         }
 
-        this._writeDebug('disable');
+        if (this._flushSource) {
+
+            GLib.source_remove(this._flushSource);
+            this._flushSource = 0;
+
+        }
+
+        this._flush();
 
     }
 
 
-    _recordFocusWindow(source) {
-
-        this._writeDebug(`recordFocusWindow source=${source}`);
+    _recordFocusWindow() {
 
         const window = global.display.focus_window;
 
         if (!window) {
 
             this._lastFocusedPid = null;
-            this._writeDebug('focus_window=none');
             return;
 
         }
@@ -64,32 +84,8 @@ export default class SoftwareUsageTracker extends Extension {
         if (window.window_type !== Meta.WindowType.NORMAL) {
 
             this._lastFocusedPid = null;
-            this._writeDebug(`skip window_type=${window.window_type}`);
+            this._debug(`skip window_type=${window.window_type}`);
             return;
-
-        }
-
-        let title = '';
-
-        try {
-
-            title = window.get_title() || '';
-
-        } catch (error) {
-
-            this._writeDebug(`get_title_error=${error}`);
-
-        }
-
-        let windowType = 'unknown';
-
-        try {
-
-            windowType = String(window.window_type);
-
-        } catch (error) {
-
-            this._writeDebug(`window_type_error=${error}`);
 
         }
 
@@ -99,27 +95,23 @@ export default class SoftwareUsageTracker extends Extension {
 
             pid = window.get_pid();
 
-        } catch (error) {
+        } catch {
 
-            this._writeDebug(`get_pid_error=${error}`);
+            return;
 
         }
 
-        this._writeDebug(
-            `focus_window title=${JSON.stringify(title)} window_type=${windowType} pid=${pid}`
-        );
+        this._debug(`focus_window pid=${pid}`);
 
         if (!pid || pid <= 0) {
 
             this._lastFocusedPid = null;
-            this._writeDebug('skip invalid_pid');
             return;
 
         }
 
         if (pid === this._lastFocusedPid) {
 
-            this._writeDebug(`skip duplicate_pid=${pid}`);
             return;
 
         }
@@ -130,7 +122,7 @@ export default class SoftwareUsageTracker extends Extension {
 
         if (!app) {
 
-            this._writeDebug(`app_not_found pid=${pid}`);
+            this._debug(`app_not_found pid=${pid}`);
             return;
 
         }
@@ -139,7 +131,7 @@ export default class SoftwareUsageTracker extends Extension {
 
         if (!info) {
 
-            this._writeDebug(`app_info_missing id=${app.get_id()}`);
+            this._debug(`app_info_missing id=${app.get_id()}`);
             return;
 
         }
@@ -149,16 +141,17 @@ export default class SoftwareUsageTracker extends Extension {
 
         if (!name) {
 
-            this._writeDebug(`app_name_missing id=${app.get_id()}`);
             return;
 
         }
 
-        this._writeDebug(
-            `app id=${app.get_id()} name=${JSON.stringify(name)} command=${JSON.stringify(command)}`
-        );
+        this._debug(`app id=${app.get_id()} name=${name} command=${command}`);
 
-        this._writeUsage(name, command);
+        this._queue(
+            `${name}|${GLib.DateTime.new_now_local()
+                .format('%Y-%m-%d %H:%M:%S')}|gui|${command}\n`,
+            false
+        );
 
     }
 
@@ -175,9 +168,9 @@ export default class SoftwareUsageTracker extends Extension {
                     return app;
                 }
 
-            } catch (error) {
+            } catch {
 
-                this._writeDebug(`get_pids_error=${error}`);
+                // pid 列表读取失败，跳过该应用。
 
             }
 
@@ -198,115 +191,70 @@ export default class SoftwareUsageTracker extends Extension {
     }
 
 
-    _writeUsage(name, command) {
+    _queue(line, isDebug) {
 
-        const directory = Gio.File.new_for_path(
-            GLib.build_filenamev([
-                GLib.get_home_dir(),
-                '.local',
-                'share',
-                'unused-software'
-            ])
-        );
+        (isDebug ? this._debugBuffer : this._usageBuffer).push(line);
 
-        try {
+        if (!this._flushSource) {
 
-            directory.make_directory_with_parents(null);
+            this._flushSource = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
 
-        } catch (error) {
+                this._flushSource = 0;
+                this._flush();
+                return GLib.SOURCE_REMOVE;
 
-            // The directory may already exist.
-
-        }
-
-        const file = Gio.File.new_for_path(
-            GLib.build_filenamev([
-                GLib.get_home_dir(),
-                '.local',
-                'share',
-                'unused-software',
-                'gui-events.log'
-            ])
-        );
-
-        try {
-
-            const stream = file.append_to(
-                Gio.FileCreateFlags.NONE,
-                null
-            );
-
-            const line = `${name}|${GLib.DateTime.new_now_local()
-                .format('%Y-%m-%d %H:%M:%S')}|gui|${command}\n`;
-
-            stream.write_all(
-                new TextEncoder().encode(line),
-                null
-            );
-
-            stream.close(null);
-            this._writeDebug(`writeUsage line=${JSON.stringify(line.trim())}`);
-
-        } catch (error) {
-
-            this._writeDebug(`writeUsage_error=${error}`);
+            });
 
         }
 
     }
 
 
-    _writeDebug(text) {
+    _debug(text) {
 
-        const directory = Gio.File.new_for_path(
-            GLib.build_filenamev([
-                GLib.get_home_dir(),
-                '.local',
-                'share',
-                'unused-software'
-            ])
-        );
-
-        try {
-
-            directory.make_directory_with_parents(null);
-
-        } catch (error) {
-
-            // The directory may already exist.
-
+        if (!this._debugEnabled) {
+            return;
         }
 
-        const file = Gio.File.new_for_path(
-            GLib.build_filenamev([
-                GLib.get_home_dir(),
-                '.local',
-                'share',
-                'unused-software',
-                'tracker-debug.log'
-            ])
+        this._queue(
+            `${GLib.DateTime.new_now_local().format('%Y-%m-%d %H:%M:%S')}|${text}\n`,
+            true
         );
+
+    }
+
+
+    _flush() {
+
+        this._flushBuffer(this._usageBuffer, this._usageFile);
+        this._flushBuffer(this._debugBuffer, this._debugFile);
+
+    }
+
+
+    _flushBuffer(buffer, file) {
+
+        if (!buffer.length) {
+            return;
+        }
+
+        const blob = buffer.join('');
+        buffer.length = 0;
 
         try {
 
-            const stream = file.append_to(
-                Gio.FileCreateFlags.NONE,
-                null
-            );
-
-            const line = `${GLib.DateTime.new_now_local()
-                .format('%Y-%m-%d %H:%M:%S')}|${text}\n`;
+            const stream = file.append_to(Gio.FileCreateFlags.NONE, null);
 
             stream.write_all(
-                new TextEncoder().encode(line),
+                new TextEncoder().encode(blob),
                 null
             );
 
             stream.close(null);
 
-        } catch (error) {
+        } catch {
 
-            log(`Software Usage Tracker: debug write failed: ${error}`);
+            // 落盘失败时丢弃本批日志，主循环不值得为日志重试。
 
         }
 

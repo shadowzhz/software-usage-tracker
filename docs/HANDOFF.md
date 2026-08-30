@@ -139,7 +139,7 @@ Firefox|2026-08-22 00:38:52|gui|/snap/bin/firefox
 | `ime-engines.log` | fcitx5 引擎切换事件（只在切换时记录） | 判定哪些输入法引擎包从未被使用 |
 | `pids.log` | 旧版进程快照（遗留） | 不再更新；只能说明采集时运行过，不能证明长期使用 |
 | `app_pids.log` | 旧版脚本识别到的 GUI PID（遗留） | 不再更新；报告已不读取 |
-| `tracker-debug.log` | 扩展调试信息 | 排查焦点、PID、App 映射问题；持续增长，无轮转 |
+| `tracker-debug.log` | 扩展调试信息 | 默认关闭（设环境变量 `GNOME_SOFTWARE_TRACKER_DEBUG=1` 开启）；与 GUI 日志走同一批量落盘路径 |
 | `tracker-test.log` | 早期测试文件 | 当前主流程不使用 |
 | `history.size.*` | Shell history 增量读取位置 | 供 `scripts/software-tracker.sh` 使用；服务重启时从断点续读，停机期间的命令仍会被补采 |
 
@@ -302,7 +302,7 @@ SOURCE 直查包 → desktop 可执行名 → desktop 应用名 → 未映射（
 3. 让 `usage.log` 和 `gui-events.log` 使用统一的 source/id 字段，减少名称匹配和包装脚本带来的歧义。
 4. 报告已输出最近使用时间、证据类型、来源；如需更强决策依据，可再增加置信度字段。
 5. 连续运行一段时间后再使用 30、90、180 天阈值比较结果，不要基于刚开始采集的短期数据卸载软件。
-6. 报告已不读取 `pids.log`、`app_pids.log`、`tracker-test.log` 等遗留文件；确认无用后可从数据目录删除。`tracker-debug.log` 持续增长且无轮转，可考虑在扩展中降低调试输出。
+6. 报告已不读取 `pids.log`、`app_pids.log`、`tracker-test.log` 等遗留文件；确认无用后可从数据目录删除。`tracker-debug.log` 已默认关闭且批量落盘，不再增长。
 7. ~~输入法引擎插件检测~~ 已完成：引擎切换证据 + 包级聚合判定（见"输入法引擎插件的检测方式"）。可选增强：`fcitx5-remote -n` 取不到的引擎（无 inputmethod conf 也无 keyboard 前缀）目前显示"归属包未知"，可积累规则。
 8. ~~依赖图清理候选 + 组件包通用检测~~ 已完成：autoremove/Snap/Flatpak 清理节，以及基于 atime 的组件包通用检测（见"组件/插件包的通用检测方式"）。可选增强：应用内插件（VS Code 扩展、浏览器扩展等）不在系统包体系内，需逐应用适配，暂不做。
 
